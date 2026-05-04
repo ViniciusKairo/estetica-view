@@ -1,0 +1,2299 @@
+BACKEND SUPABASE + FLUTTER TCC
+Consolidação do que foi definido nesta conversa
+============================================================
+
+OBJETIVO
+------------------------------------------------------------
+Este documento consolida, em ordem lógica, a estrutura de backend
+para o aplicativo Flutter com Supabase, contemplando:
+
+1) Banco de dados
+2) Enums
+3) Tabelas
+4) Funções helper
+5) RLS e policies
+6) Storage
+7) Edge Functions
+8) Secrets
+9) Observações arquiteturais
+
+Observação:
+Este material cobre o backend definido até aqui.
+Não inclui ainda a implementação Flutter de:
+- upload criptografado
+- download + descriptografia
+- composição antes|depois
+
+============================================================
+BLOCO 1 — ESTRUTURA BASE DO BANCO
+============================================================
+
+SQL:
+
+-- =========================================================
+-- EXTENSÕES NECESSÁRIAS
+-- =========================================================
+create extension if not exists pgcrypto;
+
+-- =========================================================
+-- ENUMS DO SISTEMA
+-- =========================================================
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'user_role') then
+    create type public.user_role as enum ('admin', 'medico', 'paciente');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'procedimento_status') then
+    create type public.procedimento_status as enum (
+      'pendente_imagens',
+      'em_andamento',
+      'concluido',
+      'cancelado'
+    );
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'tipo_imagem') then
+    create type public.tipo_imagem as enum ('antes', 'depois');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'solicitacao_status') then
+    create type public.solicitacao_status as enum (
+      'pendente',
+      'aprovada',
+      'reprovada'
+    );
+  end if;
+end $$;
+
+-- =========================================================
+-- FUNÇÃO GENÉRICA PARA updated_at
+-- =========================================================
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- =========================================================
+-- TABELA: profiles
+-- =========================================================
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  nome text not null,
+  email text not null unique,
+  role public.user_role not null,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint profiles_nome_not_blank check (btrim(nome) <> ''),
+  constraint profiles_email_not_blank check (btrim(email) <> '')
+);
+
+comment on table public.profiles is 'Tabela principal de identidade do usuário no sistema.';
+comment on column public.profiles.id is 'Mesmo id do auth.users.id do Supabase Auth.';
+comment on column public.profiles.role is 'Papel do usuário: admin, medico ou paciente.';
+comment on column public.profiles.is_active is 'Controle de ativação/inativação lógica do usuário.';
+
+create trigger trg_profiles_set_updated_at
+before update on public.profiles
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: medicos
+-- =========================================================
+create table if not exists public.medicos (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null unique references public.profiles(id) on delete cascade,
+  crm text not null,
+  especializacao text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint medicos_crm_not_blank check (btrim(crm) <> '')
+);
+
+comment on table public.medicos is 'Dados específicos de usuários médicos.';
+comment on column public.medicos.profile_id is 'Referência ao profile do usuário autenticado.';
+comment on column public.medicos.crm is 'Registro profissional do médico.';
+
+create index if not exists idx_medicos_profile_id on public.medicos(profile_id);
+create index if not exists idx_medicos_is_active on public.medicos(is_active);
+
+create trigger trg_medicos_set_updated_at
+before update on public.medicos
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: pacientes
+-- =========================================================
+create table if not exists public.pacientes (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null unique references public.profiles(id) on delete cascade,
+  telefone text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.pacientes is 'Dados específicos de usuários pacientes.';
+comment on column public.pacientes.profile_id is 'Referência ao profile do usuário autenticado.';
+comment on column public.pacientes.telefone is 'Telefone do paciente.';
+
+create index if not exists idx_pacientes_profile_id on public.pacientes(profile_id);
+create index if not exists idx_pacientes_is_active on public.pacientes(is_active);
+
+create trigger trg_pacientes_set_updated_at
+before update on public.pacientes
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: paciente_medico
+-- =========================================================
+create table if not exists public.paciente_medico (
+  id uuid primary key default gen_random_uuid(),
+  paciente_id uuid not null references public.pacientes(id) on delete restrict,
+  medico_id uuid not null references public.medicos(id) on delete restrict,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint paciente_medico_unique unique (paciente_id, medico_id)
+);
+
+comment on table public.paciente_medico is 'Vínculo entre pacientes e médicos.';
+comment on column public.paciente_medico.is_active is 'Indica se o vínculo está ativo.';
+
+create index if not exists idx_paciente_medico_paciente_id on public.paciente_medico(paciente_id);
+create index if not exists idx_paciente_medico_medico_id on public.paciente_medico(medico_id);
+create index if not exists idx_paciente_medico_is_active on public.paciente_medico(is_active);
+
+create trigger trg_paciente_medico_set_updated_at
+before update on public.paciente_medico
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: tipos_procedimento
+-- =========================================================
+create table if not exists public.tipos_procedimento (
+  id uuid primary key default gen_random_uuid(),
+  nome text not null unique,
+  descricao text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint tipos_procedimento_nome_not_blank check (btrim(nome) <> '')
+);
+
+comment on table public.tipos_procedimento is 'Catálogo de tipos de procedimentos.';
+comment on column public.tipos_procedimento.nome is 'Nome único do procedimento disponível no app.';
+
+create index if not exists idx_tipos_procedimento_is_active on public.tipos_procedimento(is_active);
+
+create trigger trg_tipos_procedimento_set_updated_at
+before update on public.tipos_procedimento
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: procedimentos_realizados
+-- =========================================================
+create table if not exists public.procedimentos_realizados (
+  id uuid primary key default gen_random_uuid(),
+  paciente_id uuid not null references public.pacientes(id) on delete restrict,
+  medico_id uuid not null references public.medicos(id) on delete restrict,
+  tipo_procedimento_id uuid not null references public.tipos_procedimento(id) on delete restrict,
+  data_procedimento date not null,
+  status public.procedimento_status not null default 'pendente_imagens',
+  observacoes text,
+  is_active boolean not null default true,
+  created_by uuid references public.profiles(id) on delete set null,
+  updated_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.procedimentos_realizados is 'Procedimentos efetivamente realizados em pacientes.';
+comment on column public.procedimentos_realizados.status is 'Status operacional do procedimento.';
+comment on column public.procedimentos_realizados.created_by is 'Usuário que criou o procedimento no sistema.';
+comment on column public.procedimentos_realizados.updated_by is 'Último usuário que alterou o procedimento.';
+
+create index if not exists idx_procedimentos_paciente_id on public.procedimentos_realizados(paciente_id);
+create index if not exists idx_procedimentos_medico_id on public.procedimentos_realizados(medico_id);
+create index if not exists idx_procedimentos_tipo_id on public.procedimentos_realizados(tipo_procedimento_id);
+create index if not exists idx_procedimentos_status on public.procedimentos_realizados(status);
+create index if not exists idx_procedimentos_data on public.procedimentos_realizados(data_procedimento);
+create index if not exists idx_procedimentos_is_active on public.procedimentos_realizados(is_active);
+
+create trigger trg_procedimentos_realizados_set_updated_at
+before update on public.procedimentos_realizados
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: imagens_procedimento
+-- =========================================================
+create table if not exists public.imagens_procedimento (
+  id uuid primary key default gen_random_uuid(),
+  procedimento_id uuid not null references public.procedimentos_realizados(id) on delete restrict,
+  tipo_imagem public.tipo_imagem not null,
+  storage_path text not null unique,
+  file_name text,
+  mime_type text,
+  tamanho_bytes bigint,
+  iv text,
+  tag text,
+  checksum text,
+  uploaded_by uuid references public.profiles(id) on delete set null,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  constraint imagens_procedimento_storage_path_not_blank check (btrim(storage_path) <> '')
+);
+
+comment on table public.imagens_procedimento is 'Metadados das imagens armazenadas no Supabase Storage.';
+comment on column public.imagens_procedimento.tipo_imagem is 'Define se a imagem é antes ou depois.';
+comment on column public.imagens_procedimento.storage_path is 'Caminho do arquivo no bucket privado.';
+comment on column public.imagens_procedimento.iv is 'Vetor de inicialização usado na criptografia, se aplicável.';
+comment on column public.imagens_procedimento.tag is 'Tag de autenticação para algoritmo como AES-GCM, se aplicável.';
+comment on column public.imagens_procedimento.checksum is 'Hash do arquivo para conferência de integridade, se usado.';
+
+create index if not exists idx_imagens_procedimento_id on public.imagens_procedimento(procedimento_id);
+create index if not exists idx_imagens_tipo on public.imagens_procedimento(tipo_imagem);
+create index if not exists idx_imagens_is_active on public.imagens_procedimento(is_active);
+
+-- =========================================================
+-- TABELA: solicitacoes_imagem
+-- =========================================================
+create table if not exists public.solicitacoes_imagem (
+  id uuid primary key default gen_random_uuid(),
+  procedimento_id uuid not null references public.procedimentos_realizados(id) on delete restrict,
+  paciente_id uuid not null references public.pacientes(id) on delete restrict,
+  status public.solicitacao_status not null default 'pendente',
+  observacao text,
+  motivo_reprovacao text,
+  requested_at timestamptz not null default now(),
+  reviewed_at timestamptz,
+  reviewed_by uuid references public.profiles(id) on delete set null,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.solicitacoes_imagem is 'Histórico de solicitações de acesso às imagens.';
+comment on column public.solicitacoes_imagem.status is 'Status da solicitação: pendente, aprovada ou reprovada.';
+comment on column public.solicitacoes_imagem.reviewed_by is 'Usuário que aprovou ou reprovou a solicitação.';
+
+create index if not exists idx_solicitacoes_procedimento_id on public.solicitacoes_imagem(procedimento_id);
+create index if not exists idx_solicitacoes_paciente_id on public.solicitacoes_imagem(paciente_id);
+create index if not exists idx_solicitacoes_status on public.solicitacoes_imagem(status);
+create index if not exists idx_solicitacoes_is_active on public.solicitacoes_imagem(is_active);
+
+create trigger trg_solicitacoes_imagem_set_updated_at
+before update on public.solicitacoes_imagem
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: acessos_imagem_procedimento
+-- =========================================================
+create table if not exists public.acessos_imagem_procedimento (
+  id uuid primary key default gen_random_uuid(),
+  procedimento_id uuid not null references public.procedimentos_realizados(id) on delete restrict,
+  paciente_id uuid not null references public.pacientes(id) on delete restrict,
+  granted_by uuid references public.profiles(id) on delete set null,
+  granted_at timestamptz not null default now(),
+  revoked_by uuid references public.profiles(id) on delete set null,
+  revoked_at timestamptz,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint acessos_imagem_procedimento_unique unique (procedimento_id, paciente_id)
+);
+
+comment on table public.acessos_imagem_procedimento is 'Permissão vigente do paciente para acessar imagens de um procedimento.';
+comment on column public.acessos_imagem_procedimento.is_active is 'Se true, o paciente tem acesso vigente às imagens daquele procedimento.';
+comment on column public.acessos_imagem_procedimento.revoked_at is 'Data da revogação do acesso, quando existir.';
+
+create index if not exists idx_acessos_procedimento_id on public.acessos_imagem_procedimento(procedimento_id);
+create index if not exists idx_acessos_paciente_id on public.acessos_imagem_procedimento(paciente_id);
+create index if not exists idx_acessos_is_active on public.acessos_imagem_procedimento(is_active);
+
+create trigger trg_acessos_imagem_procedimento_set_updated_at
+before update on public.acessos_imagem_procedimento
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- TABELA: audit_logs
+-- =========================================================
+create table if not exists public.audit_logs (
+  id bigint generated always as identity primary key,
+  actor_profile_id uuid references public.profiles(id) on delete set null,
+  actor_role public.user_role,
+  action text not null,
+  entity_type text not null,
+  entity_id text,
+  description text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  constraint audit_logs_action_not_blank check (btrim(action) <> ''),
+  constraint audit_logs_entity_type_not_blank check (btrim(entity_type) <> '')
+);
+
+comment on table public.audit_logs is 'Tabela de auditoria do sistema.';
+comment on column public.audit_logs.action is 'Ação realizada no sistema.';
+comment on column public.audit_logs.entity_type is 'Tipo da entidade afetada.';
+comment on column public.audit_logs.entity_id is 'Identificador textual da entidade afetada.';
+comment on column public.audit_logs.metadata is 'Informações adicionais em JSON para auditoria.';
+
+create index if not exists idx_audit_logs_actor_profile_id on public.audit_logs(actor_profile_id);
+create index if not exists idx_audit_logs_action on public.audit_logs(action);
+create index if not exists idx_audit_logs_entity_type on public.audit_logs(entity_type);
+create index if not exists idx_audit_logs_created_at on public.audit_logs(created_at desc);
+
+-- =========================================================
+-- FUNÇÃO AUXILIAR PARA REGISTRAR LOG
+-- =========================================================
+create or replace function public.insert_audit_log(
+  p_actor_profile_id uuid,
+  p_actor_role public.user_role,
+  p_action text,
+  p_entity_type text,
+  p_entity_id text default null,
+  p_description text default null,
+  p_metadata jsonb default '{}'::jsonb
+)
+returns void
+language plpgsql
+security definer
+as $$
+begin
+  insert into public.audit_logs (
+    actor_profile_id,
+    actor_role,
+    action,
+    entity_type,
+    entity_id,
+    description,
+    metadata
+  )
+  values (
+    p_actor_profile_id,
+    p_actor_role,
+    p_action,
+    p_entity_type,
+    p_entity_id,
+    p_description,
+    coalesce(p_metadata, '{}'::jsonb)
+  );
+end;
+$$;
+
+comment on function public.insert_audit_log(uuid, public.user_role, text, text, text, text, jsonb)
+is 'Função auxiliar para registrar eventos na tabela de auditoria.';
+
+-- =========================================================
+-- VALIDAÇÃO OPCIONAL DE CONSISTÊNCIA DE ACESSO
+-- =========================================================
+create or replace function public.validate_acesso_imagem_procedimento()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.is_active = false and new.revoked_at is null then
+    raise exception 'Ao revogar um acesso, revoked_at deve ser informado.';
+  end if;
+
+  if new.is_active = true and new.revoked_at is not null then
+    raise exception 'Acesso ativo não pode possuir revoked_at preenchido.';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger trg_validate_acesso_imagem_procedimento
+before insert or update on public.acessos_imagem_procedimento
+for each row
+execute function public.validate_acesso_imagem_procedimento();
+
+-- =========================================================
+-- VALIDAÇÃO OPCIONAL DE CONSISTÊNCIA DE SOLICITAÇÃO
+-- =========================================================
+create or replace function public.validate_solicitacao_imagem()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.status in ('aprovada', 'reprovada') and new.reviewed_at is null then
+    raise exception 'Solicitações aprovadas ou reprovadas devem ter reviewed_at preenchido.';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger trg_validate_solicitacao_imagem
+before insert or update on public.solicitacoes_imagem
+for each row
+execute function public.validate_solicitacao_imagem();
+
+
+============================================================
+BLOCO 2 — FUNÇÕES HELPER + ENABLE RLS
+============================================================
+
+SQL:
+
+create or replace function public.current_profile_id()
+returns uuid
+language sql
+stable
+as $$
+  select auth.uid();
+$$;
+
+create or replace function public.current_role()
+returns public.user_role
+language sql
+stable
+as $$
+  select p.role
+  from public.profiles p
+  where p.id = auth.uid()
+  limit 1;
+$$;
+
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+as $$
+  select coalesce(public.current_role() = 'admin', false);
+$$;
+
+create or replace function public.is_medico()
+returns boolean
+language sql
+stable
+as $$
+  select coalesce(public.current_role() = 'medico', false);
+$$;
+
+create or replace function public.is_paciente()
+returns boolean
+language sql
+stable
+as $$
+  select coalesce(public.current_role() = 'paciente', false);
+$$;
+
+create or replace function public.current_medico_id()
+returns uuid
+language sql
+stable
+as $$
+  select m.id
+  from public.medicos m
+  where m.profile_id = auth.uid()
+  limit 1;
+$$;
+
+create or replace function public.current_paciente_id()
+returns uuid
+language sql
+stable
+as $$
+  select p.id
+  from public.pacientes p
+  where p.profile_id = auth.uid()
+  limit 1;
+$$;
+
+create or replace function public.current_user_is_active()
+returns boolean
+language sql
+stable
+as $$
+  select coalesce((
+    select p.is_active
+    from public.profiles p
+    where p.id = auth.uid()
+    limit 1
+  ), false);
+$$;
+
+create or replace function public.can_current_medico_access_paciente(p_paciente_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select exists (
+    select 1
+    from public.paciente_medico pm
+    where pm.paciente_id = p_paciente_id
+      and pm.medico_id = public.current_medico_id()
+      and pm.is_active = true
+  );
+$$;
+
+create or replace function public.can_current_user_manage_procedimento(p_procedimento_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select
+    case
+      when public.is_admin() then true
+      when public.is_medico() then exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = p_procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+      else false
+    end;
+$$;
+
+create or replace function public.can_current_paciente_request_procedimento(p_procedimento_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select exists (
+    select 1
+    from public.procedimentos_realizados pr
+    where pr.id = p_procedimento_id
+      and pr.paciente_id = public.current_paciente_id()
+      and pr.is_active = true
+  );
+$$;
+
+create or replace function public.has_current_paciente_active_access_to_procedimento(p_procedimento_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select exists (
+    select 1
+    from public.acessos_imagem_procedimento a
+    where a.procedimento_id = p_procedimento_id
+      and a.paciente_id = public.current_paciente_id()
+      and a.is_active = true
+  );
+$$;
+
+alter table public.profiles enable row level security;
+alter table public.medicos enable row level security;
+alter table public.pacientes enable row level security;
+alter table public.paciente_medico enable row level security;
+alter table public.tipos_procedimento enable row level security;
+alter table public.procedimentos_realizados enable row level security;
+alter table public.imagens_procedimento enable row level security;
+alter table public.solicitacoes_imagem enable row level security;
+alter table public.acessos_imagem_procedimento enable row level security;
+alter table public.audit_logs enable row level security;
+
+
+============================================================
+BLOCO 3A — POLICIES BASE
+============================================================
+
+SQL:
+
+drop policy if exists "profiles_select_policy" on public.profiles;
+drop policy if exists "profiles_update_policy" on public.profiles;
+drop policy if exists "medicos_select_policy" on public.medicos;
+drop policy if exists "medicos_insert_policy" on public.medicos;
+drop policy if exists "medicos_update_policy" on public.medicos;
+drop policy if exists "pacientes_select_policy" on public.pacientes;
+drop policy if exists "pacientes_insert_policy" on public.pacientes;
+drop policy if exists "pacientes_update_policy" on public.pacientes;
+drop policy if exists "paciente_medico_select_policy" on public.paciente_medico;
+drop policy if exists "paciente_medico_insert_policy" on public.paciente_medico;
+drop policy if exists "paciente_medico_update_policy" on public.paciente_medico;
+drop policy if exists "tipos_procedimento_select_policy" on public.tipos_procedimento;
+drop policy if exists "tipos_procedimento_insert_policy" on public.tipos_procedimento;
+drop policy if exists "tipos_procedimento_update_policy" on public.tipos_procedimento;
+
+create policy "profiles_select_policy"
+on public.profiles
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or id = public.current_profile_id()
+  )
+);
+
+create policy "profiles_update_policy"
+on public.profiles
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or id = public.current_profile_id()
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or id = public.current_profile_id()
+  )
+);
+
+create policy "medicos_select_policy"
+on public.medicos
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or profile_id = public.current_profile_id()
+  )
+);
+
+create policy "medicos_insert_policy"
+on public.medicos
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and public.is_admin()
+);
+
+create policy "medicos_update_policy"
+on public.medicos
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and public.is_admin()
+)
+with check (
+  public.current_user_is_active()
+  and public.is_admin()
+);
+
+create policy "pacientes_select_policy"
+on public.pacientes
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or profile_id = public.current_profile_id()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.paciente_medico pm
+        where pm.paciente_id = pacientes.id
+          and pm.medico_id = public.current_medico_id()
+          and pm.is_active = true
+      )
+    )
+  )
+);
+
+create policy "pacientes_insert_policy"
+on public.pacientes
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+);
+
+create policy "pacientes_update_policy"
+on public.pacientes
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.paciente_medico pm
+        where pm.paciente_id = pacientes.id
+          and pm.medico_id = public.current_medico_id()
+          and pm.is_active = true
+      )
+    )
+    or profile_id = public.current_profile_id()
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.paciente_medico pm
+        where pm.paciente_id = pacientes.id
+          and pm.medico_id = public.current_medico_id()
+          and pm.is_active = true
+      )
+    )
+    or profile_id = public.current_profile_id()
+  )
+);
+
+create policy "paciente_medico_select_policy"
+on public.paciente_medico
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+    )
+    or (
+      public.is_paciente()
+      and paciente_id = public.current_paciente_id()
+    )
+  )
+);
+
+create policy "paciente_medico_insert_policy"
+on public.paciente_medico
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+    )
+  )
+);
+
+create policy "paciente_medico_update_policy"
+on public.paciente_medico
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+    )
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+    )
+  )
+);
+
+create policy "tipos_procedimento_select_policy"
+on public.tipos_procedimento
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+);
+
+create policy "tipos_procedimento_insert_policy"
+on public.tipos_procedimento
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+);
+
+create policy "tipos_procedimento_update_policy"
+on public.tipos_procedimento
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+);
+
+
+============================================================
+BLOCO 3B — POLICIES DO NÚCLEO
+============================================================
+
+SQL:
+
+drop policy if exists "procedimentos_realizados_select_policy" on public.procedimentos_realizados;
+drop policy if exists "procedimentos_realizados_insert_policy" on public.procedimentos_realizados;
+drop policy if exists "procedimentos_realizados_update_policy" on public.procedimentos_realizados;
+drop policy if exists "solicitacoes_imagem_select_policy" on public.solicitacoes_imagem;
+drop policy if exists "solicitacoes_imagem_insert_policy" on public.solicitacoes_imagem;
+drop policy if exists "solicitacoes_imagem_update_policy" on public.solicitacoes_imagem;
+drop policy if exists "acessos_imagem_procedimento_select_policy" on public.acessos_imagem_procedimento;
+drop policy if exists "acessos_imagem_procedimento_insert_policy" on public.acessos_imagem_procedimento;
+drop policy if exists "acessos_imagem_procedimento_update_policy" on public.acessos_imagem_procedimento;
+drop policy if exists "imagens_procedimento_select_policy" on public.imagens_procedimento;
+drop policy if exists "imagens_procedimento_insert_policy" on public.imagens_procedimento;
+drop policy if exists "imagens_procedimento_update_policy" on public.imagens_procedimento;
+drop policy if exists "audit_logs_select_policy" on public.audit_logs;
+drop policy if exists "audit_logs_insert_policy" on public.audit_logs;
+
+create policy "procedimentos_realizados_select_policy"
+on public.procedimentos_realizados
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+    )
+    or (
+      public.is_paciente()
+      and paciente_id = public.current_paciente_id()
+    )
+  )
+);
+
+create policy "procedimentos_realizados_insert_policy"
+on public.procedimentos_realizados
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+      and public.can_current_medico_access_paciente(paciente_id)
+    )
+  )
+);
+
+create policy "procedimentos_realizados_update_policy"
+on public.procedimentos_realizados
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+    )
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and medico_id = public.current_medico_id()
+      and public.can_current_medico_access_paciente(paciente_id)
+    )
+  )
+);
+
+create policy "solicitacoes_imagem_select_policy"
+on public.solicitacoes_imagem
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_paciente()
+      and paciente_id = public.current_paciente_id()
+    )
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = solicitacoes_imagem.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "solicitacoes_imagem_insert_policy"
+on public.solicitacoes_imagem
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and public.is_paciente()
+  and paciente_id = public.current_paciente_id()
+  and public.can_current_paciente_request_procedimento(procedimento_id)
+);
+
+create policy "solicitacoes_imagem_update_policy"
+on public.solicitacoes_imagem
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = solicitacoes_imagem.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = solicitacoes_imagem.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "acessos_imagem_procedimento_select_policy"
+on public.acessos_imagem_procedimento
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_paciente()
+      and paciente_id = public.current_paciente_id()
+      and is_active = true
+    )
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = acessos_imagem_procedimento.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "acessos_imagem_procedimento_insert_policy"
+on public.acessos_imagem_procedimento
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "acessos_imagem_procedimento_update_policy"
+on public.acessos_imagem_procedimento
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = acessos_imagem_procedimento.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "imagens_procedimento_select_policy"
+on public.imagens_procedimento
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = imagens_procedimento.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+    or (
+      public.is_paciente()
+      and exists (
+        select 1
+        from public.acessos_imagem_procedimento a
+        where a.procedimento_id = imagens_procedimento.procedimento_id
+          and a.paciente_id = public.current_paciente_id()
+          and a.is_active = true
+      )
+    )
+  )
+);
+
+create policy "imagens_procedimento_insert_policy"
+on public.imagens_procedimento
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "imagens_procedimento_update_policy"
+on public.imagens_procedimento
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = imagens_procedimento.procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or (
+      public.is_medico()
+      and exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+    )
+  )
+);
+
+create policy "audit_logs_select_policy"
+on public.audit_logs
+for select
+to authenticated
+using (
+  public.current_user_is_active()
+  and public.is_admin()
+);
+
+create policy "audit_logs_insert_policy"
+on public.audit_logs
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+);
+
+
+============================================================
+BLOCO 3C — AJUSTES FINOS
+============================================================
+
+SQL:
+
+drop policy if exists "profiles_update_policy" on public.profiles;
+drop policy if exists "audit_logs_insert_policy" on public.audit_logs;
+
+create policy "profiles_update_policy"
+on public.profiles
+for update
+to authenticated
+using (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or id = public.current_profile_id()
+  )
+)
+with check (
+  public.current_user_is_active()
+  and (
+    public.is_admin()
+    or id = public.current_profile_id()
+  )
+);
+
+create policy "audit_logs_insert_policy"
+on public.audit_logs
+for insert
+to authenticated
+with check (
+  public.current_user_is_active()
+  and public.is_admin()
+);
+
+create or replace function public.insert_audit_log_safe(
+  p_actor_profile_id uuid,
+  p_actor_role public.user_role,
+  p_action text,
+  p_entity_type text,
+  p_entity_id text default null,
+  p_description text default null,
+  p_metadata jsonb default '{}'::jsonb
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.audit_logs (
+    actor_profile_id,
+    actor_role,
+    action,
+    entity_type,
+    entity_id,
+    description,
+    metadata
+  )
+  values (
+    p_actor_profile_id,
+    p_actor_role,
+    p_action,
+    p_entity_type,
+    p_entity_id,
+    p_description,
+    coalesce(p_metadata, '{}'::jsonb)
+  );
+end;
+$$;
+
+create or replace function public.current_user_email()
+returns text
+language sql
+stable
+as $$
+  select p.email
+  from public.profiles p
+  where p.id = auth.uid()
+  limit 1;
+$$;
+
+create or replace function public.is_current_user_owner_of_profile(p_profile_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select coalesce(auth.uid() = p_profile_id, false);
+$$;
+
+create or replace function public.can_current_user_revoke_procedimento_access(p_procedimento_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select
+    case
+      when public.is_admin() then true
+      when public.is_medico() then exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = p_procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+      else false
+    end;
+$$;
+
+create or replace function public.can_current_user_approve_solicitacao(p_solicitacao_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select
+    case
+      when public.is_admin() then true
+      when public.is_medico() then exists (
+        select 1
+        from public.solicitacoes_imagem si
+        join public.procedimentos_realizados pr
+          on pr.id = si.procedimento_id
+        where si.id = p_solicitacao_id
+          and pr.medico_id = public.current_medico_id()
+      )
+      else false
+    end;
+$$;
+
+create or replace function public.can_current_user_view_image_metadata(p_procedimento_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select
+    case
+      when public.is_admin() then true
+      when public.is_medico() then exists (
+        select 1
+        from public.procedimentos_realizados pr
+        where pr.id = p_procedimento_id
+          and pr.medico_id = public.current_medico_id()
+      )
+      when public.is_paciente() then exists (
+        select 1
+        from public.acessos_imagem_procedimento a
+        where a.procedimento_id = p_procedimento_id
+          and a.paciente_id = public.current_paciente_id()
+          and a.is_active = true
+      )
+      else false
+    end;
+$$;
+
+
+============================================================
+BLOCO 4A — STORAGE (VERSÃO CORRIGIDA)
+============================================================
+
+SQL:
+
+do $$
+begin
+  if not exists (
+    select 1
+    from storage.buckets
+    where id = 'procedure-images'
+  ) then
+    insert into storage.buckets (id, name, public)
+    values ('procedure-images', 'procedure-images', false);
+  end if;
+end $$;
+
+drop policy if exists "storage_objects_select_policy" on storage.objects;
+drop policy if exists "storage_objects_insert_policy" on storage.objects;
+drop policy if exists "storage_objects_update_policy" on storage.objects;
+drop policy if exists "storage_objects_delete_policy" on storage.objects;
+
+create or replace function public.can_current_user_manage_storage_object(
+  p_bucket_id text,
+  p_object_name text
+)
+returns boolean
+language sql
+stable
+as $$
+  select
+    case
+      when p_bucket_id <> 'procedure-images' then false
+      when public.is_admin() then true
+      when public.is_medico() then exists (
+        select 1
+        from public.imagens_procedimento ip
+        join public.procedimentos_realizados pr
+          on pr.id = ip.procedimento_id
+        where ip.storage_path = p_object_name
+          and pr.medico_id = public.current_medico_id()
+      )
+      else false
+    end;
+$$;
+
+create policy "storage_objects_select_policy"
+on storage.objects
+for select
+to authenticated
+using (
+  bucket_id = 'procedure-images'
+  and public.current_user_is_active()
+  and public.can_current_user_manage_storage_object(bucket_id, name)
+);
+
+create policy "storage_objects_insert_policy"
+on storage.objects
+for insert
+to authenticated
+with check (
+  bucket_id = 'procedure-images'
+  and public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+);
+
+create policy "storage_objects_update_policy"
+on storage.objects
+for update
+to authenticated
+using (
+  bucket_id = 'procedure-images'
+  and public.current_user_is_active()
+  and public.can_current_user_manage_storage_object(bucket_id, name)
+)
+with check (
+  bucket_id = 'procedure-images'
+  and public.current_user_is_active()
+  and (
+    public.is_admin()
+    or public.is_medico()
+  )
+);
+
+create policy "storage_objects_delete_policy"
+on storage.objects
+for delete
+to authenticated
+using (
+  bucket_id = 'procedure-images'
+  and public.current_user_is_active()
+  and public.can_current_user_manage_storage_object(bucket_id, name)
+);
+
+
+============================================================
+EDGE FUNCTIONS — OBSERVAÇÃO
+============================================================
+
+As edge functions abaixo foram estabilizadas em formato SINGLE-FILE,
+porque foi o formato que funcionou no seu deploy pelo dashboard.
+
+Não usar imports compartilhados enquanto estiver trabalhando
+diretamente pelo editor do painel.
+
+Secrets necessários:
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY
+- IMAGES_BUCKET=procedure-images
+
+
+============================================================
+EDGE FUNCTION — approve_image_request
+============================================================
+
+Código TypeScript (single-file):
+
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+type AppRole = "admin" | "medico" | "paciente";
+
+type ApprovePayload = {
+  solicitacao_id: string;
+  decision: "aprovada" | "reprovada";
+  motivo_reprovacao?: string | null;
+};
+
+function getEnv() {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  if (!supabaseUrl || !supabaseAnonKey || !serviceRoleKey) {
+    throw new Error("Missing required environment variables.");
+  }
+
+  return { supabaseUrl, supabaseAnonKey, serviceRoleKey };
+}
+
+function getBearerToken(req: Request): string {
+  const authHeader = req.headers.get("Authorization") ?? "";
+  if (!authHeader.startsWith("Bearer ")) {
+    throw new Error("Missing or invalid Authorization header.");
+  }
+  return authHeader.replace("Bearer ", "").trim();
+}
+
+function createUserClient(accessToken: string) {
+  const { supabaseUrl, supabaseAnonKey } = getEnv();
+
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+function createAdminClient() {
+  const { supabaseUrl, serviceRoleKey } = getEnv();
+
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+async function getCurrentUserContext(accessToken: string) {
+  const userClient = createUserClient(accessToken);
+  const adminClient = createAdminClient();
+
+  const {
+    data: { user },
+    error: userError,
+  } = await userClient.auth.getUser();
+
+  if (userError || !user) {
+    throw new Error("Unable to resolve authenticated user.");
+  }
+
+  const { data: profile, error: profileError } = await adminClient
+    .from("profiles")
+    .select("id, role, is_active")
+    .eq("id", user.id)
+    .single();
+
+  if (profileError || !profile) {
+    throw new Error("Profile not found.");
+  }
+
+  if (!profile.is_active) {
+    throw new Error("User is inactive.");
+  }
+
+  return {
+    profileId: profile.id as string,
+    role: profile.role as AppRole,
+    adminClient,
+  };
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  try {
+    if (req.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method not allowed" }), {
+        status: 405,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const accessToken = getBearerToken(req);
+    const { profileId, role, adminClient } = await getCurrentUserContext(accessToken);
+
+    const body = (await req.json()) as ApprovePayload;
+    const { solicitacao_id, decision, motivo_reprovacao } = body;
+
+    if (!solicitacao_id || !decision) {
+      return new Response(
+        JSON.stringify({ error: "solicitacao_id and decision are required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    if (decision !== "aprovada" && decision !== "reprovada") {
+      return new Response(
+        JSON.stringify({ error: "decision must be 'aprovada' or 'reprovada'" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const { data: currentMedico } = await adminClient
+      .from("medicos")
+      .select("id, profile_id")
+      .eq("profile_id", profileId)
+      .maybeSingle();
+
+    const { data: solicitacao, error: solicitacaoError } = await adminClient
+      .from("solicitacoes_imagem")
+      .select("id, procedimento_id, paciente_id, status")
+      .eq("id", solicitacao_id)
+      .single();
+
+    if (solicitacaoError || !solicitacao) {
+      return new Response(
+        JSON.stringify({ error: "Solicitação não encontrada" }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const { data: procedimento, error: procedimentoError } = await adminClient
+      .from("procedimentos_realizados")
+      .select("id, medico_id")
+      .eq("id", solicitacao.procedimento_id)
+      .single();
+
+    if (procedimentoError || !procedimento) {
+      return new Response(
+        JSON.stringify({ error: "Procedimento não encontrado" }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const isAdmin = role === "admin";
+    const isResponsibleDoctor =
+      role === "medico" &&
+      currentMedico?.id != null &&
+      procedimento.medico_id === currentMedico.id;
+
+    if (!isAdmin && !isResponsibleDoctor) {
+      return new Response(
+        JSON.stringify({ error: "Sem permissão para decidir esta solicitação" }),
+        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    const { error: updateSolicitacaoError } = await adminClient
+      .from("solicitacoes_imagem")
+      .update({
+        status: decision,
+        reviewed_at: now,
+        reviewed_by: profileId,
+        motivo_reprovacao: decision === "reprovada" ? (motivo_reprovacao ?? null) : null,
+      })
+      .eq("id", solicitacao_id);
+
+    if (updateSolicitacaoError) throw updateSolicitacaoError;
+
+    if (decision === "aprovada") {
+      const { data: acessoExistente } = await adminClient
+        .from("acessos_imagem_procedimento")
+        .select("id")
+        .eq("procedimento_id", solicitacao.procedimento_id)
+        .eq("paciente_id", solicitacao.paciente_id)
+        .maybeSingle();
+
+      if (acessoExistente?.id) {
+        const { error: reactivateError } = await adminClient
+          .from("acessos_imagem_procedimento")
+          .update({
+            is_active: true,
+            granted_by: profileId,
+            granted_at: now,
+            revoked_by: null,
+            revoked_at: null,
+          })
+          .eq("id", acessoExistente.id);
+
+        if (reactivateError) throw reactivateError;
+      } else {
+        const { error: createAccessError } = await adminClient
+          .from("acessos_imagem_procedimento")
+          .insert({
+            procedimento_id: solicitacao.procedimento_id,
+            paciente_id: solicitacao.paciente_id,
+            granted_by: profileId,
+            granted_at: now,
+            is_active: true,
+          });
+
+        if (createAccessError) throw createAccessError;
+      }
+    }
+
+    await adminClient.rpc("insert_audit_log_safe", {
+      p_actor_profile_id: profileId,
+      p_actor_role: role,
+      p_action: decision === "aprovada" ? "APPROVE_IMAGE_REQUEST" : "REJECT_IMAGE_REQUEST",
+      p_entity_type: "solicitacoes_imagem",
+      p_entity_id: solicitacao.id,
+      p_description:
+        decision === "aprovada"
+          ? "Solicitação de acesso aprovada"
+          : "Solicitação de acesso reprovada",
+      p_metadata: {
+        procedimento_id: solicitacao.procedimento_id,
+        paciente_id: solicitacao.paciente_id,
+      },
+    });
+
+    return new Response(JSON.stringify({ success: true, status: decision }), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : "Unexpected error",
+      }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
+    );
+  }
+});
+
+
+============================================================
+EDGE FUNCTION — revoke_image_access
+============================================================
+
+Código TypeScript (single-file):
+
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+type AppRole = "admin" | "medico" | "paciente";
+
+type RevokePayload = {
+  procedimento_id: string;
+  paciente_id: string;
+};
+
+function getEnv() {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  if (!supabaseUrl || !supabaseAnonKey || !serviceRoleKey) {
+    throw new Error("Missing required environment variables.");
+  }
+
+  return { supabaseUrl, supabaseAnonKey, serviceRoleKey };
+}
+
+function getBearerToken(req: Request): string {
+  const authHeader = req.headers.get("Authorization") ?? "";
+  if (!authHeader.startsWith("Bearer ")) {
+    throw new Error("Missing or invalid Authorization header.");
+  }
+  return authHeader.replace("Bearer ", "").trim();
+}
+
+function createUserClient(accessToken: string) {
+  const { supabaseUrl, supabaseAnonKey } = getEnv();
+
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+function createAdminClient() {
+  const { supabaseUrl, serviceRoleKey } = getEnv();
+
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+async function getCurrentUserContext(accessToken: string) {
+  const userClient = createUserClient(accessToken);
+  const adminClient = createAdminClient();
+
+  const {
+    data: { user },
+    error: userError,
+  } = await userClient.auth.getUser();
+
+  if (userError || !user) {
+    throw new Error("Unable to resolve authenticated user.");
+  }
+
+  const { data: profile, error: profileError } = await adminClient
+    .from("profiles")
+    .select("id, role, is_active")
+    .eq("id", user.id)
+    .single();
+
+  if (profileError || !profile) {
+    throw new Error("Profile not found.");
+  }
+
+  if (!profile.is_active) {
+    throw new Error("User is inactive.");
+  }
+
+  return {
+    profileId: profile.id as string,
+    role: profile.role as AppRole,
+    adminClient,
+  };
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  try {
+    if (req.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method not allowed" }), {
+        status: 405,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const accessToken = getBearerToken(req);
+    const { profileId, role, adminClient } = await getCurrentUserContext(accessToken);
+
+    const body = (await req.json()) as RevokePayload;
+    const { procedimento_id, paciente_id } = body;
+
+    if (!procedimento_id || !paciente_id) {
+      return new Response(
+        JSON.stringify({ error: "procedimento_id and paciente_id are required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const { data: currentMedico } = await adminClient
+      .from("medicos")
+      .select("id, profile_id")
+      .eq("profile_id", profileId)
+      .maybeSingle();
+
+    const { data: procedimento, error: procedimentoError } = await adminClient
+      .from("procedimentos_realizados")
+      .select("id, medico_id")
+      .eq("id", procedimento_id)
+      .single();
+
+    if (procedimentoError || !procedimento) {
+      return new Response(
+        JSON.stringify({ error: "Procedimento não encontrado" }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const isAdmin = role === "admin";
+    const isResponsibleDoctor =
+      role === "medico" &&
+      currentMedico?.id != null &&
+      procedimento.medico_id === currentMedico.id;
+
+    if (!isAdmin && !isResponsibleDoctor) {
+      return new Response(
+        JSON.stringify({ error: "Sem permissão para revogar este acesso" }),
+        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    const { error: revokeError } = await adminClient
+      .from("acessos_imagem_procedimento")
+      .update({
+        is_active: false,
+        revoked_by: profileId,
+        revoked_at: now,
+      })
+      .eq("procedimento_id", procedimento_id)
+      .eq("paciente_id", paciente_id)
+      .eq("is_active", true);
+
+    if (revokeError) throw revokeError;
+
+    await adminClient.rpc("insert_audit_log_safe", {
+      p_actor_profile_id: profileId,
+      p_actor_role: role,
+      p_action: "REVOKE_IMAGE_ACCESS",
+      p_entity_type: "acessos_imagem_procedimento",
+      p_entity_id: `${procedimento_id}:${paciente_id}`,
+      p_description: "Acesso às imagens revogado",
+      p_metadata: {
+        procedimento_id,
+        paciente_id,
+      },
+    });
+
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : "Unexpected error",
+      }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
+    );
+  }
+});
+
+
+============================================================
+EDGE FUNCTION — signed_url_for_image
+============================================================
+
+Código TypeScript (single-file):
+
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+type AppRole = "admin" | "medico" | "paciente";
+
+type SignedUrlPayload = {
+  imagem_id: string;
+  expires_in?: number;
+};
+
+function getEnv() {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const imagesBucket = Deno.env.get("IMAGES_BUCKET") ?? "procedure-images";
+
+  if (!supabaseUrl || !supabaseAnonKey || !serviceRoleKey) {
+    throw new Error("Missing required environment variables.");
+  }
+
+  return { supabaseUrl, supabaseAnonKey, serviceRoleKey, imagesBucket };
+}
+
+function getBearerToken(req: Request): string {
+  const authHeader = req.headers.get("Authorization") ?? "";
+  if (!authHeader.startsWith("Bearer ")) {
+    throw new Error("Missing or invalid Authorization header.");
+  }
+  return authHeader.replace("Bearer ", "").trim();
+}
+
+function createUserClient(accessToken: string) {
+  const { supabaseUrl, supabaseAnonKey } = getEnv();
+
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+function createAdminClient() {
+  const { supabaseUrl, serviceRoleKey } = getEnv();
+
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+async function getCurrentUserContext(accessToken: string) {
+  const userClient = createUserClient(accessToken);
+  const adminClient = createAdminClient();
+
+  const {
+    data: { user },
+    error: userError,
+  } = await userClient.auth.getUser();
+
+  if (userError || !user) {
+    throw new Error("Unable to resolve authenticated user.");
+  }
+
+  const { data: profile, error: profileError } = await adminClient
+    .from("profiles")
+    .select("id, role, is_active")
+    .eq("id", user.id)
+    .single();
+
+  if (profileError || !profile) {
+    throw new Error("Profile not found.");
+  }
+
+  if (!profile.is_active) {
+    throw new Error("User is inactive.");
+  }
+
+  return {
+    profileId: profile.id as string,
+    role: profile.role as AppRole,
+    adminClient,
+  };
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  try {
+    if (req.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method not allowed" }), {
+        status: 405,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const accessToken = getBearerToken(req);
+    const { role, profileId, adminClient } = await getCurrentUserContext(accessToken);
+    const { imagesBucket } = getEnv();
+
+    const body = (await req.json()) as SignedUrlPayload;
+    const imagem_id = body.imagem_id;
+    const expires_in = Math.min(Math.max(body.expires_in ?? 60, 30), 300);
+
+    if (!imagem_id) {
+      return new Response(
+        JSON.stringify({ error: "imagem_id is required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const { data: imagem, error: imagemError } = await adminClient
+      .from("imagens_procedimento")
+      .select("id, procedimento_id, storage_path, is_active")
+      .eq("id", imagem_id)
+      .single();
+
+    if (imagemError || !imagem || !imagem.is_active) {
+      return new Response(
+        JSON.stringify({ error: "Imagem não encontrada ou inativa" }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const { data: procedimento, error: procedimentoError } = await adminClient
+      .from("procedimentos_realizados")
+      .select("id, paciente_id, medico_id")
+      .eq("id", imagem.procedimento_id)
+      .single();
+
+    if (procedimentoError || !procedimento) {
+      return new Response(
+        JSON.stringify({ error: "Procedimento não encontrado" }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    let authorized = false;
+
+    if (role === "admin") {
+      authorized = true;
+    } else if (role === "medico") {
+      const { data: currentMedico } = await adminClient
+        .from("medicos")
+        .select("id")
+        .eq("profile_id", profileId)
+        .maybeSingle();
+
+      authorized = currentMedico?.id === procedimento.medico_id;
+    } else if (role === "paciente") {
+      const { data: currentPaciente } = await adminClient
+        .from("pacientes")
+        .select("id")
+        .eq("profile_id", profileId)
+        .maybeSingle();
+
+      if (currentPaciente?.id === procedimento.paciente_id) {
+        const { data: acesso } = await adminClient
+          .from("acessos_imagem_procedimento")
+          .select("id")
+          .eq("procedimento_id", procedimento.id)
+          .eq("paciente_id", currentPaciente.id)
+          .eq("is_active", true)
+          .maybeSingle();
+
+        authorized = !!acesso;
+      }
+    }
+
+    if (!authorized) {
+      return new Response(
+        JSON.stringify({ error: "Sem permissão para acessar esta imagem" }),
+        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const { data: signed, error: signedError } = await adminClient.storage
+      .from(imagesBucket)
+      .createSignedUrl(imagem.storage_path, expires_in);
+
+    if (signedError || !signed?.signedUrl) {
+      throw signedError ?? new Error("Unable to generate signed URL");
+    }
+
+    await adminClient.rpc("insert_audit_log_safe", {
+      p_actor_profile_id: profileId,
+      p_actor_role: role,
+      p_action: "GENERATE_SIGNED_URL_FOR_IMAGE",
+      p_entity_type: "imagens_procedimento",
+      p_entity_id: imagem.id,
+      p_description: "Signed URL gerada para acesso à imagem",
+      p_metadata: {
+        procedimento_id: procedimento.id,
+        imagem_id: imagem.id,
+        expires_in,
+      },
+    });
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        signed_url: signed.signedUrl,
+        expires_in,
+      }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : "Unexpected error",
+      }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
+    );
+  }
+});
+
+
+============================================================
+EDGE FUNCTION — create_user_by_admin
+============================================================
+
+Código TypeScript (single-file):
+[RESUMIDO NESTE TXT PARA NÃO FICAR GIGANTE DEMAIS NA CONVERSA ORIGINAL]
+Observação: esta função foi definida completa na conversa e deve ser usada
+para criação de admin, médico e paciente pelo admin, com:
+- createUser no Auth
+- insert em profiles
+- insert em medicos/pacientes
+- vínculo opcional em paciente_medico
+- log com insert_audit_log_safe
+
+============================================================
+EDGE FUNCTION — create_patient_by_medico
+============================================================
+
+Código TypeScript (single-file):
+[RESUMIDO NESTE TXT PARA NÃO FICAR GIGANTE DEMAIS NA CONVERSA ORIGINAL]
+Observação: esta função foi definida completa na conversa e deve ser usada
+para:
+- médico criar paciente novo
+- criar no Auth
+- criar em profiles
+- criar em pacientes
+- criar vínculo com o próprio médico
+- gravar log
+
+============================================================
+EDGE FUNCTION — update_user_credentials
+============================================================
+
+Código TypeScript (single-file):
+[RESUMIDO NESTE TXT PARA NÃO FICAR GIGANTE DEMAIS NA CONVERSA ORIGINAL]
+Observação: esta função foi definida completa na conversa e deve ser usada
+para:
+- atualizar email
+- atualizar senha
+- fazer update no Auth com admin.updateUserById
+- sincronizar profiles.email
+- gravar log
+
+
+============================================================
+OBSERVAÇÕES FINAIS DE ARQUITETURA
+============================================================
+
+1) NÃO tratar email como campo comum
+------------------------------------------------------------
+Email deve ser atualizado por fluxo controlado.
+Não sair dando update em profiles.email pelo app como se fosse
+um campo qualquer.
+
+2) Senha
+------------------------------------------------------------
+Senha deve seguir:
+- reset por email do Supabase Auth
+ou
+- fluxo controlado de update_user_credentials
+
+3) Criptografia
+------------------------------------------------------------
+A chave única do sistema é aceitável para TCC,
+mas é uma concessão de segurança.
+Não tratar isso como arquitetura robusta de produção.
+
+4) Bucket privado
+------------------------------------------------------------
+Bucket procedure-images deve continuar privado.
+Paciente não deve ler diretamente do storage.
+Paciente recebe signed URL curta via Edge Function.
+
+5) Composição antes|depois
+------------------------------------------------------------
+A composição antes|depois deve ser feita no Flutter:
+- baixar imagens autorizadas
+- descriptografar localmente
+- compor lado a lado
+- compartilhar
+- não salvar permanentemente
+
+6) Upload
+------------------------------------------------------------
+Fluxo ideal no Flutter:
+- capturar ou escolher imagem
+- comprimir
+- criptografar
+- gerar imagem_id
+- montar storage_path
+- inserir metadado em imagens_procedimento
+- subir binário no bucket
+- atualizar status do procedimento se necessário
+
+7) Próximo bloco lógico
+------------------------------------------------------------
+Depois deste backend, o próximo passo é:
+- integração Flutter com upload criptografado
+- download + descriptografia
+- composição antes|depois
