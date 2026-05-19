@@ -77,12 +77,12 @@ class AdminDashboardScreen extends StatelessWidget {
                 subtitle: 'Auditoria e histórico administrativo do sistema.',
                 onTap: () => context.push('/logs'),
               ),
-              ActionCard(
-                icon: Icons.manage_accounts_rounded,
-                title: 'Minha conta',
-                subtitle: 'Atualize seus dados e altere sua senha.',
-                onTap: () => context.push('/profile'),
-              ),
+              //ActionCard(
+              //  icon: Icons.manage_accounts_rounded,
+              //  title: 'Minha conta',
+              //  subtitle: 'Atualize seus dados e altere sua senha.',
+              //  onTap: () => context.push('/profile'),
+              //),
             ],
           ),
         ],

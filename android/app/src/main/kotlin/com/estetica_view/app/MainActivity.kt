@@ -1,4 +1,4 @@
-package com.example.view
+package com.estetica_view.app
 
 import io.flutter.embedding.android.FlutterActivity
 

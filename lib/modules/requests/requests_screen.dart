@@ -76,8 +76,8 @@ class _RequestsScreenState extends State<RequestsScreen> {
           .select('''
             id,
             data_procedimento,
-            medicos(
-              profiles(nome)
+            medicos!medico_id(
+            profiles(nome)
             ),
             tipos_procedimento!tipo_procedimento_id(nome),
             solicitacoes_imagem(status, requested_at),
@@ -183,8 +183,7 @@ class _RequestsScreenState extends State<RequestsScreen> {
   }
 
   bool _hasActiveRequest(String? status) {
-    return status == 'pendente' ||
-        status == 'aprovada';
+    return status == 'pendente' || status == 'aprovada';
   }
 
   String _statusLabel(String? status) {
