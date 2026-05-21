@@ -183,6 +183,7 @@ class _RequestsScreenState extends State<RequestsScreen> {
   }
 
   bool _hasActiveRequest(String? status) {
+    // 'reprovada' allows the patient to submit a new request
     return status == 'pendente' || status == 'aprovada';
   }
 
@@ -254,18 +255,35 @@ class _RequestsScreenState extends State<RequestsScreen> {
                                   item.tipoNome,
                                   style: Theme.of(
                                     context,
-                                  ).textTheme.titleMedium,
+                                  ).textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.w800,
+                                  ),
                                 ),
                                 const SizedBox(height: 8),
-                                Text('Médico: ${item.medicoNome}'),
-                                const SizedBox(height: 4),
-                                Text(
-                                  'Data do procedimento: ${_formatDate(item.dataRealizacao)}',
+                                _InfoRow(
+                                  label: 'Médico',
+                                  value: item.medicoNome,
                                 ),
                                 const SizedBox(height: 4),
-                                Text(
-                                  'Status: ${_statusLabel(item.requestStatus)}',
+                                _InfoRow(
+                                  label: 'Data',
+                                  value: _formatDate(item.dataRealizacao),
                                 ),
+                                const SizedBox(height: 4),
+                                _InfoRow(
+                                  label: 'Status',
+                                  value: _statusLabel(item.requestStatus),
+                                ),
+                                if (item.requestStatus == 'reprovada') ...[
+                                  const SizedBox(height: 4),
+                                  const Text(
+                                    'Sua solicitação foi recusada. Você pode solicitar novamente.',
+                                    style: TextStyle(
+                                      color: Color(0xFFB91C1C),
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
                                 const SizedBox(height: 16),
                                 SizedBox(
                                   width: double.infinity,
@@ -290,6 +308,35 @@ class _RequestsScreenState extends State<RequestsScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _InfoRow({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 60,
+          child: Text(
+            '$label:',
+            style: const TextStyle(
+              fontWeight: FontWeight.w700,
+              color: Color(0xFF475569),
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(value, style: const TextStyle(color: Color(0xFF0F172A))),
+        ),
+      ],
     );
   }
 }
